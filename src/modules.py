@@ -1,3 +1,6 @@
+import functools
+import multiprocessing
+
 import torch
 import torch.nn as nn
 import torchaudio
@@ -8,6 +11,9 @@ N_FFT = base_dict['N_FFT']
 HOP_LENGTH = base_dict['HOP_LENGTH']
 AUDIO_LEN = base_dict['AUDIO_LEN']
 SAMPLE_RATE = base_dict['SAMPLE_RATE']
+
+
+pool = multiprocessing.Pool()
 
 
 class ComplexMaskOnPolarCoo(nn.Module):
@@ -29,11 +35,12 @@ class ISTFT(nn.Module):
         super(self.__class__, self).__init__()
 
     def forward(self, Y_hat):
-        return torchaudio.functional.istft(Y_hat,
-                                           n_fft=N_FFT,
-                                           hop_length=HOP_LENGTH,
-                                           length=AUDIO_LEN,
-                                           window=torch.hann_window(N_FFT)).squeeze()
+        win = torch.hann_window(N_FFT, device=Y_hat.device)
+        istfts = [
+            torch.istft(x, n_fft=N_FFT, hop_length=HOP_LENGTH, length=AUDIO_LEN, window=win)
+            for x in Y_hat
+        ]
+        return torch.stack(istfts).squeeze()
 
 
 class STFT(nn.Module):
@@ -43,7 +50,7 @@ class STFT(nn.Module):
     def forward(self, voise_noise):
         voise_noise = torch.stft(voise_noise, n_fft=N_FFT,
                                  hop_length=HOP_LENGTH,
-                                 window=torch.hann_window(N_FFT))
+                                 window=torch.hann_window(N_FFT, device=voise_noise.device))
         return voise_noise.unsqueeze(1)
 
 
@@ -82,10 +89,12 @@ def pesq_metric(y_hat, y_true):
         y_hat = y_hat.cpu().data.numpy()
         y = y_true.cpu().data.numpy()
 
-        sum_pesq = 0
-        for i in range(len(y)):
-            sum_pesq += pesq(y[i], y_hat[i], SAMPLE_RATE)
+    return [pesq(y1, y_hat1, SAMPLE_RATE) for y1, y_hat1 in zip(y, y_hat)]
 
-        sum_pesq /= len(y)
-        return sum_pesq
 
+def pesq_metric_async(y_hat, y_true):
+    with torch.no_grad():
+        y_hat = y_hat.cpu().data.numpy()
+        y = y_true.cpu().data.numpy()
+
+    return pool.starmap_async(functools.partial(pesq, fs=SAMPLE_RATE), zip(y, y_hat))

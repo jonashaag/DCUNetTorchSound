@@ -15,8 +15,11 @@ base_dict = {'SAMPLE_RATE': SAMPLE_RATE,
              'AUDIO_LEN': AUDIO_LEN,
              'TARGET_SNR_LIST_TRAIN': TARGET_SNR_LIST_TRAIN,
              'TARGET_SNR_LIST_TEST': TARGET_SNR_LIST_TEST,
-             'BATCH_SIZE': 10
-             }
+             # For DCUNet-16
+             #**{'BATCH_SIZE': 33, 'USE_AMP': False},
+             #DCUNet-20L
+             **{'BATCH_SIZE': 2, 'USE_AMP': False},
+            }
 
 
 def get_model_config(model_features, encoder_depth):

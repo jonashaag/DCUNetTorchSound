@@ -1,3 +1,4 @@
+import time
 import os
 import sys
 import logging
@@ -8,6 +9,7 @@ from torchvision import transforms
 import torchaudio
 import torch.nn as nn
 import torch.optim as optim
+import tqdm
 
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.append(BASE_DIR)
@@ -17,7 +19,100 @@ from src.datasets import DEMAND, VCTKNoise, BASE_DIR
 from src.models_config import base_dict
 from src.unet import UNet
 from src.modules import STFT, ComplexMaskOnPolarCoo, ISTFT, WeightedSDR, \
-    pesq_metric
+    pesq_metric_async
+
+import torch
+from torch.nn.modules.loss import _Loss
+
+EPS = 1e-8
+
+COMPUTE_PESQ_PERCENTAGE = 0.2
+
+
+class SingleSrcNegSDR(_Loss):
+    """ Base class for single-source negative SI-SDR, SD-SDR and SNR.
+
+        Args:
+            sdr_type (string): choose between "snr" for plain SNR, "sisdr" for
+                SI-SDR and "sdsdr" for SD-SDR [1].
+            zero_mean (bool, optional): by default it zero mean the target and
+                estimate before computing the loss.
+            take_log (bool, optional): by default the log10 of sdr is returned.
+            reduction (string, optional): Specifies the reduction to apply to
+                the output:
+            ``'none'`` | ``'mean'``. ``'none'``: no reduction will be applied,
+            ``'mean'``: the sum of the output will be divided by the number of
+            elements in the output.
+
+        Shape:
+            est_targets (:class:`torch.Tensor`): Expected shape [batch, time].
+                Batch of target estimates.
+            targets (:class:`torch.Tensor`): Expected shape [batch, time].
+                Batch of training targets.
+
+        Returns:
+            :class:`torch.Tensor`: with shape [batch] if reduction='none' else
+                [] scalar if reduction='mean'.
+
+        Examples:
+
+            >>> import torch
+            >>> from asteroid.losses import PITLossWrapper
+            >>> targets = torch.randn(10, 2, 32000)
+            >>> est_targets = torch.randn(10, 2, 32000)
+            >>> loss_func = PITLossWrapper(SingleSrcNegSDR("sisdr"),
+            >>>                            pit_from='pw_pt')
+            >>> loss = loss_func(est_targets, targets)
+
+        References:
+            [1] Le Roux, Jonathan, et al. "SDR half-baked or well done." IEEE
+            International Conference on Acoustics, Speech and Signal
+            Processing (ICASSP) 2019.
+        """
+    def __init__(self, sdr_type, zero_mean=True, take_log=True,
+                 reduction='none'):
+        assert reduction != 'sum', NotImplementedError
+        super().__init__(reduction=reduction)
+
+        assert sdr_type in ["snr", "sisdr", "sdsdr"]
+        self.sdr_type = sdr_type
+        self.zero_mean = zero_mean
+        self.take_log = take_log
+
+    def forward(self, est_target, target):
+        assert target.size() == est_target.size(), (est_target.shape, target.shape)
+        # Step 1. Zero-mean norm
+        if self.zero_mean:
+            mean_source = torch.mean(target, dim=1, keepdim=True)
+            mean_estimate = torch.mean(est_target, dim=1, keepdim=True)
+            target = target - mean_source
+            est_target = est_target - mean_estimate
+        # Step 2. Pair-wise SI-SDR.
+        if self.sdr_type in ["sisdr", "sdsdr"]:
+            # [batch, 1]
+            dot = torch.sum(est_target * target, dim=1, keepdim=True)
+            # [batch, 1]
+            s_target_energy = torch.sum(target ** 2, dim=1,
+                                        keepdim=True) + EPS
+            # [batch, time]
+            scaled_target = dot * target / s_target_energy
+        else:
+            # [batch, time]
+            scaled_target = target
+        if self.sdr_type in ["sdsdr", "snr"]:
+            e_noise = est_target - target
+        else:
+            e_noise = est_target - scaled_target
+        # [batch]
+        losses = torch.sum(scaled_target ** 2, dim=1) / (
+                torch.sum(e_noise ** 2, dim=1) + EPS)
+        if self.take_log:
+            losses = 10 * torch.log10(losses + EPS)
+        losses = losses.mean() if self.reduction == 'mean' else losses
+        return - losses
+
+
+singlesrc_neg_sisdr = SingleSrcNegSDR("sisdr", reduction="mean")
 
 AUDIO_LEN = base_dict['AUDIO_LEN']
 SAMPLE_RATE = base_dict['SAMPLE_RATE']
@@ -111,6 +206,18 @@ def get_dataloades(train_data, test_data):
                                                    drop_last=True)
     return data_loader_train, data_loader_test
 
+def get_dataloades():
+    import ds2
+    t, v = ds2.getds(False, {"data": {
+        "sample_rate": SAMPLE_RATE, "segment": AUDIO_LEN/SAMPLE_RATE,
+        #"clean_files": "/root/clean/**/*.wav",
+        #"ir_files": "/root/small*/**/*.wav",
+  "clean_files": "/home/jo/dev/audio-experiments-data/clean/16kHz/*nonsil*/**/*.wav",
+  "ir_files": "/home/jo/dev/audio-experiments-data/small-manual-yes-gte0.3-0.85/**/*.wav",
+        }, "training": {"batch_size": BATCH_SIZE, "num_workers": 3}})
+    return t, v
+
+
 
 def load_model_from_checkpoint(model_name, optimizer=None, training=False):
     if torch.cuda.is_available():
@@ -183,9 +290,10 @@ if __name__ == "__main__":
     device = torch.device(f"cuda:{args.device}" if torch.cuda.is_available() else "cpu")
     logging.info(f"Cuda device available: {device}")
 
-    vctk_noise_train, vctk_noise_test = get_datasets()
-    data_loader_train, data_loader_test = get_dataloades(train_data=vctk_noise_train,
-                                                         test_data=vctk_noise_test)
+    #vctk_noise_train, vctk_noise_test = get_datasets()
+    #data_loader_train, data_loader_test = get_dataloades(train_data=vctk_noise_train,
+    #                                                     test_data=vctk_noise_test)
+    data_loader_train, data_loader_test = get_dataloades()
     model = Net(model_features=args.model_features,
                 encoder_depth=args.encoder_depth)
     optimizer = optim.Adam(model.parameters(), lr=0.001)
@@ -194,7 +302,7 @@ if __name__ == "__main__":
                                                      factor=0.5,
                                                      patience=5,
                                                      verbose=True)
-    epoch_start, start_pesq_test = 0, 0
+    epoch_start, start_pesq_test = 0, 20
 
     if args.from_checkpoint is not None:
         ckp_dict = load_model_from_checkpoint(model_name=args.from_checkpoint,
@@ -217,115 +325,130 @@ if __name__ == "__main__":
 
     model.to(device)
 
-    for epoch in range(epoch_start, args.num_epochs):
+    for epoch in tqdm.trange(epoch_start, args.num_epochs, desc="Epoch"):
+        start_time = time.time()
         loss_train, pesq_train = [], []
         loss_test, pesq_test = [], []
         model.train()
-        for i, data in enumerate(data_loader_train):
-            logging.info(f"Epoch {epoch} - {i}")
-            (waveform_sound_noise, waveform, waveform_noise, _, _,
-             speaker_id, utterance_id, noise_origin, noise_id, target_snr) = data
-
-            logging.info(
-                f"Data ids {' '.join([f'{i}-{j}-{f}-{z}-{k}' for i, j, z, k, f in zip(speaker_id, utterance_id, noise_id, target_snr, noise_origin)])}")
-
-            waveform_sound_noise = waveform_sound_noise.to(device)
-            waveform = waveform.to(device)
-            waveform_noise = waveform_noise.to(device)
-
-            optimizer.zero_grad()
-
-            estimated_sound = model(waveform_sound_noise)
-            logging.info(f"Epoch {epoch} - {i} estimated_sound got")
-
-            loss = loss_sdr(output=estimated_sound,
-                            signal_with_noise=waveform_sound_noise,
-                            target_signal=waveform,
-                            noise=waveform_noise)
-
-            logging.info(f"Epoch {epoch} - {i} loss calculated")
-
-            pesq = pesq_metric(y_hat=estimated_sound, y_true=waveform)
-            logging.info(f"Epoch {epoch} - {i} pesq calculated")
-
-            loss.backward()
-            optimizer.step()
-
-            logging.info(f"Epoch {epoch} - {i} backward done")
-
-            loss_train.append(loss.item())
-            pesq_train.append(pesq)
-
-            if i % PRINT_N_BATCH == PRINT_N_BATCH - 1:
-                print('train [%d, %5d] loss: %.3f, pesq: %.3f' %
-                      (epoch, i, np.mean(loss_train), np.nanmean(pesq_train)))
-
-        mode = 'w' if epoch == 0 else 'a'
-        write_metrics_to_file(f'train_loss_{model_prefix}.txt',
-                              loss_train,
-                              epoch=epoch,
-                              mode=mode)
-        write_metrics_to_file(f'train_pesq_{model_prefix}.txt',
-                              pesq_train,
-                              epoch=epoch,
-                              mode=mode)
-
-        with torch.no_grad():
-            model.eval()
-            for i, data in enumerate(data_loader_test):
-                (waveform_sound_noise, waveform, waveform_noise, _, _,
-                 speaker_id, utterance_id, noise_origin, noise_id, target_snr) = data
-
-                logging.info(
-                    f"Test data ids {' '.join([f'{i}-{j}-{f}-{z}-{k}' for i, j, z, k, f in zip(speaker_id, utterance_id, noise_id, target_snr, noise_origin)])}")
-
+        with tqdm.tqdm(data_loader_train, desc=f"Epoch {epoch} train batch") as train_progress:
+            for i, data in enumerate(train_progress):
+                waveform_sound_noise, waveform = data
                 waveform_sound_noise = waveform_sound_noise.to(device)
                 waveform = waveform.to(device)
-                waveform_noise = waveform_noise.to(device)
+
+                optimizer.zero_grad()
 
                 estimated_sound = model(waveform_sound_noise)
-                logging.info(f"Epoch {epoch} - {i} estimated_sound got")
+                logging.debug(f"Epoch {epoch} - {i} estimated_sound got")
 
-                loss = loss_sdr(output=estimated_sound,
-                                signal_with_noise=waveform_sound_noise,
-                                target_signal=waveform,
-                                noise=waveform_noise)
-                logging.info(f"Epoch {epoch} - {i} loss calculated")
+                loss = singlesrc_neg_sisdr(estimated_sound, waveform)
+                logging.debug(f"Epoch {epoch} - {i} loss calculated")
 
-                pesq = pesq_metric(y_hat=estimated_sound, y_true=waveform)
-                logging.info(f"Epoch {epoch} - {i} pesq calculated")
+                if np.random.uniform() < COMPUTE_PESQ_PERCENTAGE:
+                    pesq = pesq_metric_async(y_hat=estimated_sound, y_true=waveform)
+                    logging.debug(f"Epoch {epoch} - {i} pesq calculated")
+                else:
+                    pesq = None
 
-                loss_test.append(loss.item())
-                pesq_test.append(pesq)
+                loss.backward()
+                optimizer.step()
 
-            print('test %d loss: %.3f, pesq: %.3f' %
-                  (epoch, np.mean(loss_test), np.mean(pesq_test)))
+                logging.debug(f"Epoch {epoch} - {i} backward done")
 
-            write_metrics_to_file(f'test_loss_{model_prefix}.txt',
-                                  loss_test,
+                loss_train.append(loss.item())
+                pesq_train.append(pesq)
+
+                try:
+                    info = {
+                        "loss": np.mean(loss_train[-10:]),
+                    }
+                    if COMPUTE_PESQ_PERCENTAGE:
+                        info["pesq"] = np.nanmean([
+                            np.nanmean(async_res.get()) if async_res.ready() else float("NaN")
+                            for async_res in pesq_train[-10:]
+                            if async_res is not None
+                        ])
+                    train_progress.set_postfix(info)
+                except Exception as err:
+                    train_progress.write(str(err))
+                finally:
+                    pass
+
+            pesq_train = [
+                np.nanmean(async_res.get()) if async_res is not None else float("NaN")
+                for async_res in pesq_train
+            ]
+            mode = 'w' if epoch == 0 else 'a'
+            write_metrics_to_file(f'train_loss_{model_prefix}.txt',
+                                  loss_train,
                                   epoch=epoch,
                                   mode=mode)
-            write_metrics_to_file(f'test_pesq_{model_prefix}.txt',
-                                  pesq_test,
+            write_metrics_to_file(f'train_pesq_{model_prefix}.txt',
+                                  pesq_train,
                                   epoch=epoch,
                                   mode=mode)
 
-            scheduler.step(np.mean(loss_test))
+        with tqdm.tqdm(data_loader_test, desc=f"Epoch {epoch} val batch") as val_progress:
+            with torch.no_grad():
+                model.eval()
+                for i, data in enumerate(val_progress):
+                    waveform_sound_noise, waveform = data
 
-            if not args.save_best or (args.save_best and np.mean(pesq_test) > start_pesq_test):
-                path = os.path.join(BASE_DIR, 'models',
-                                    'chp_model_{}_{}_epoch_{}_{:.2f}_{:.2f}.pth'.format(args.model_features,
-                                                                                        args.encoder_depth,
-                                                                                        epoch,
-                                                                                        np.mean(loss_test),
-                                                                                        np.nanmean(pesq_test)
-                                                                                        ))
-                torch.save({
-                    'epoch': epoch,
-                    'model_state_dict': model.state_dict(),
-                    'optimizer_state_dict': optimizer.state_dict(),
-                    'loss': np.mean(loss_test),
-                    'pesq': np.nanmean(pesq_test)
-                }, path)
+                    waveform_sound_noise = waveform_sound_noise.to(device)
+                    waveform = waveform.to(device)
 
-                start_pesq_test = np.nanmean(pesq_test)
+                    estimated_sound = model(waveform_sound_noise)
+                    logging.debug(f"Epoch {epoch} val - {i} estimated_sound got")
+
+                    loss = singlesrc_neg_sisdr(estimated_sound, waveform)
+                    logging.debug(f"Epoch {epoch} val - {i} loss calculated")
+
+                    pesq = pesq_metric_async(y_hat=estimated_sound, y_true=waveform)
+
+                    loss_test.append(loss.item())
+                    pesq_test.append(pesq)
+
+                    val_progress.set_postfix({
+                        "loss": np.mean(loss_test),
+                        "pesq": np.nanmean([
+                            np.nanmean(async_res.get()) if async_res.ready() else float("NaN")
+                            for async_res in pesq_test
+                        ])
+                    })
+
+                pesq_test = [np.nanmean(async_res.get()) for async_res in pesq_test]
+
+                logging.info('test %d loss: %.3f, pesq: %.3f' %
+                      (epoch, np.mean(loss_test), np.nanmean(pesq_test)))
+                val_progress.write('test %d loss: %.3f, pesq: %.3f' %
+                      (epoch, np.mean(loss_test), np.nanmean(pesq_test)))
+
+                write_metrics_to_file(f'test_loss_{model_prefix}.txt',
+                                      loss_test,
+                                      epoch=epoch,
+                                      mode=mode)
+                write_metrics_to_file(f'test_pesq_{model_prefix}.txt',
+                                      pesq_test,
+                                      epoch=epoch,
+                                      mode=mode)
+
+                scheduler.step(np.mean(loss_test))
+
+                #if not args.save_best or (args.save_best and np.mean(pesq_test) > start_pesq_test):
+                if not args.save_best or (args.save_best and np.mean(loss_test) < start_pesq_test):
+                    path = os.path.join(BASE_DIR, 'models',
+                                        'chp_model_{}_{}_epoch_{}_{:.2f}_{:.2f}.pth'.format(args.model_features,
+                                                                                            args.encoder_depth,
+                                                                                            epoch,
+                                                                                            np.mean(loss_test),
+                                                                                            np.nanmean(pesq_test)
+                                                                                            ))
+                    torch.save({
+                        'epoch': epoch,
+                        'model_state_dict': model.state_dict(),
+                        'optimizer_state_dict': optimizer.state_dict(),
+                        'loss': np.mean(loss_test),
+                        'pesq': np.nanmean(pesq_test)
+                    }, path)
+
+                    start_pesq_test = np.nanmean(pesq_test)

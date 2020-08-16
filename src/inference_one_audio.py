@@ -1,4 +1,5 @@
 import os
+import soundfile
 import time
 import argparse
 import numpy as np
@@ -126,19 +127,28 @@ if __name__ == "__main__":
         print(f'Init file: {path_to_init_file}')
         procecces_wave_file_name = f'model_{model_pref}_{utterance_id}_{noise_origin}_{noise_id}_{args.target_snr}.wav'
     else:
-        sound_noise_wave = get_voice_noise_for_inference_custom(args.custom_file)
+        sound_noise_wave, sample_rate = torchaudio.load(args.custom_file)
+        assert sample_rate >= SAMPLE_RATE
+        if sample_rate > SAMPLE_RATE:
+            print("Warning: Resampling")
+            sound_noise_wave = torchaudio.transforms.Resample(orig_freq=sample_rate, new_freq=SAMPLE_RATE)(sound_noise_wave)
         print(f'Init file: {args.custom_file}')
         custom_file_name = os.path.splitext(os.path.split(args.custom_file)[1])[0]
         procecces_wave_file_name = f'model_{model_pref}_{custom_file_name}.wav'
 
     start = time.time()
-    estimated_sound = model_inference(model, sound_noise_wave)
+    nbatch = int(sound_noise_wave.shape[1] / base_dict["AUDIO_LEN"] + 0.5)
+    padded = torch.nn.functional.pad(sound_noise_wave, ((0, nbatch * base_dict["AUDIO_LEN"] - sound_noise_wave.shape[1])))
+    estimated_sound = []
+    chunks = padded.reshape(nbatch, -1)
+    for idx, chunk in enumerate(chunks[5:10]):
+        print(f"Compute chunk {idx}")
+        estimated_sound.append(
+            model_inference(model, chunk.reshape(1, -1)).detach().numpy()
+        )
     inference_time = round(time.time() - start, 3)
 
     path_estimated_sound = os.path.join(path_for_results,
                                         procecces_wave_file_name)
-    torchaudio.save(path_estimated_sound,
-                    estimated_sound,
-                    SAMPLE_RATE,
-                    precision=32)
+    soundfile.write(path_estimated_sound, np.hstack(estimated_sound), samplerate=16000)
     print(f'Saved to {path_estimated_sound}, inference time {inference_time} s')
