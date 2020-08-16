@@ -36,11 +36,13 @@ class ISTFT(nn.Module):
 
     def forward(self, Y_hat):
         window = torch.hann_window(N_FFT, device=Y_hat)
-        return torchaudio.functional.istft(Y_hat,
-                                           n_fft=N_FFT,
-                                           hop_length=HOP_LENGTH,
-                                           length=AUDIO_LEN,
-                                           window=window).squeeze()
+        # Workaround for https://github.com/pytorch/pytorch/issues/42813
+        istfts = [
+            torch.istft(x, n_fft=N_FFT, hop_length=HOP_LENGTH,
+                        length=AUDIO_LEN, window=window)
+            for x in Y_hat
+        ]
+        return torch.stack(istfts).squeeze()
 
 
 class STFT(nn.Module):
